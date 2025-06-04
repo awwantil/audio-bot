@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath" // Для работы с путями и расширениями
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -150,36 +151,40 @@ func downloadFile(bot *tgbotapi.BotAPI, fileID string, localPath string) error {
 	if err != nil {
 		return fmt.Errorf("bot.GetFile failed: %w", err)
 	}
-
-	url := file.Link(bot.Token)       // Используйте bot.Token, если он не пустой
-	if bot.Token == "" && url == "" { // Для некоторых библиотек/конфигураций ссылка может быть уже полной
-		url = file.FilePath // Предполагаем, что FilePath содержит полный URL, если токен не нужен для формирования ссылки
-	} else if url == "" && file.FilePath != "" { // Если Link пуст, но FilePath есть
+	url := file.Link(bot.Token)
+	if url == "" && file.FilePath != "" {
 		url = fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", bot.Token, file.FilePath)
 	}
 
-	resp, err := http.Get(url)
+	// Используем кастомный HTTP клиент с таймаутами
+	client := &http.Client{
+		Timeout: 30 * time.Second, // Общий таймаут на запрос
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   10 * time.Second, // Таймаут на TLS handshake
+			ResponseHeaderTimeout: 10 * time.Second, // Таймаут на получение заголовков ответа
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("http.Get failed for %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("bad status: %s, body: %s", resp.Status, string(bodyBytes))
 	}
-
 	out, err := os.Create(localPath)
 	if err != nil {
 		return fmt.Errorf("os.Create failed for %s: %w", localPath, err)
 	}
 	defer out.Close()
-
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		return fmt.Errorf("io.Copy failed: %w", err)
 	}
 	log.Printf("Downloaded file %s to %s", fileID, localPath)
+
 	return nil
 }
 
@@ -296,7 +301,6 @@ func main() {
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
 	// Создаем директорию для временных файлов, если ее нет (os.CreateTemp может использовать системную)
-	// Но если вы хотите свою, то:
 	// tempDir := "./temp_audio"
 	// if _, err := os.Stat(tempDir); os.IsNotExist(err) {
 	// 	os.Mkdir(tempDir, 0755)
