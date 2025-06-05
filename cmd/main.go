@@ -12,26 +12,31 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath" // Для работы с путями и расширениями
+	"path/filepath"
+	"regexp"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 const (
-	concurrencyLimit  = 10
-	bothubApiURL      = "https://bothub.chat/api/v2/openai/v1/audio/transcriptions"
-	defaultAudioModel = "whisper-1" // Модель по умолчанию, как в вашем curl примере
+	concurrencyLimit            = 10
+	bothubApiURL                = "https://bothub.chat/api/v2/openai/v1/audio/transcriptions"
+	bothubChatCompletionsApiURL = "https://bothub.chat/api/v2/openai/v1/chat/completions"
+	defaultAudioModel           = "whisper-1"
+	gptModelForYoutubeSummary   = "gpt-4o"
+	maxMessageTextLength        = 4096
 
-	menuCommandRecognize = "🎤 Распознать речь"
-	menuCommandInfo      = "ℹ️ Информация"
-	menuCommandSettings  = "⚙️ Настройки"
+	menuCommandRecognize   = "🎤 Распознать речь"
+	menuCommandInfo        = "ℹ️ Информация"
+	menuCommandSettings    = "⚙️ Настройки"
+	menuCommandYoutubeInfo = "🎞️ Инфо о Youtube-видео" // Новый пункт меню
 )
 
-// Структура для разбора JSON-ответа от API
+// Структура для разбора JSON-ответа от API распознавания речи
 type TranscriptionResponse struct {
-	Text  string    `json:"text"` // Предполагаем, что текст находится в поле "text"
-	Error *struct { // Опционально, для обработки ошибок от API
+	Text  string `json:"text"`
+	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 		Param   string `json:"param"`
@@ -39,21 +44,52 @@ type TranscriptionResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// Структуры для API Chat Completions
+type ChatCompletionRequest struct {
+	Model    string        `json:"model"`
+	Messages []ChatMessage `json:"messages"`
+}
+
+type ChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ChatCompletionResponse struct {
+	Choices []struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		// Могут быть и другие поля, например, finish_reason, но для задачи нужен только content
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Param   string `json:"param"`
+		Code    string `json:"code"`
+	} `json:"error,omitempty"`
+	// Можно добавить другие поля если нужно, например, Usage
+}
+
+var youtubeRegex = regexp.MustCompile(`^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+(\S*)?$`)
+
+func isValidYoutubeLink(url string) bool {
+	return youtubeRegex.MatchString(url)
+}
+
 func recognizeSpeech(audioFilePath string, cfg *config.Config) (string, error) {
 	log.Printf("STT: Processing %s with Bothub API", audioFilePath)
 
-	// 1. Открыть аудиофайл
 	file, err := os.Open(audioFilePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open audio file %s: %w", audioFilePath, err)
 	}
 	defer file.Close()
 
-	// 2. Создать тело multipart/form-data запроса
 	var requestBody bytes.Buffer
 	multipartWriter := multipart.NewWriter(&requestBody)
 
-	// Добавить поле 'file'
 	fileWriter, err := multipartWriter.CreateFormFile("file", filepath.Base(audioFilePath))
 	if err != nil {
 		return "", fmt.Errorf("failed to create form file for %s: %w", audioFilePath, err)
@@ -63,48 +99,38 @@ func recognizeSpeech(audioFilePath string, cfg *config.Config) (string, error) {
 		return "", fmt.Errorf("failed to copy file content to multipart writer: %w", err)
 	}
 
-	// Добавить поле 'model'
 	err = multipartWriter.WriteField("model", defaultAudioModel)
 	if err != nil {
 		return "", fmt.Errorf("failed to write model field to multipart writer: %w", err)
 	}
 
-	// Завершить формирование multipart-тела
-	// Это важно, так как записывает финальный boundary
 	err = multipartWriter.Close()
 	if err != nil {
 		return "", fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	// 3. Создать HTTP POST запрос
 	req, err := http.NewRequest("POST", bothubApiURL, &requestBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to create new HTTP request: %w", err)
 	}
 
-	// 4. Установить заголовки
 	req.Header.Set("Authorization", "Bearer "+cfg.BothubApiToken)
-	// Content-Type устанавливается автоматически multipartWriter'ом, включая boundary
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 
-	// 5. Выполнить запрос
-	client := &http.Client{}
+	client := &http.Client{Timeout: 60 * time.Second} // Увеличен таймаут для потенциально больших файлов
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute HTTP request to Bothub API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// 6. Прочитать тело ответа
 	responseBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response body from Bothub API: %w", err)
 	}
 
-	// 7. Проверить статус-код ответа
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Bothub API returned non-OK status: %s. Response: %s", resp.Status, string(responseBodyBytes))
-		// Попытаемся распарсить ошибку, если API ее возвращает в JSON
 		var errorResp TranscriptionResponse
 		if json.Unmarshal(responseBodyBytes, &errorResp) == nil && errorResp.Error != nil {
 			return "", fmt.Errorf("Bothub API error: %s (Type: %s, Code: %s, Param: %s), HTTP Status: %s",
@@ -113,20 +139,19 @@ func recognizeSpeech(audioFilePath string, cfg *config.Config) (string, error) {
 		return "", fmt.Errorf("Bothub API request failed with status %s and body: %s", resp.Status, string(responseBodyBytes))
 	}
 
-	// 8. Распарсить JSON ответ
 	var transcriptionResp TranscriptionResponse
 	err = json.Unmarshal(responseBodyBytes, &transcriptionResp)
 	if err != nil {
 		return "", fmt.Errorf("failed to unmarshal JSON response from Bothub API (%s): %w. Response body: %s", resp.Status, err, string(responseBodyBytes))
 	}
 
-	if transcriptionResp.Text == "" && transcriptionResp.Error == nil {
-		// Это может случиться, если поле 'text' отсутствует или пустое, но ошибки нет
-		log.Printf("Warning: Bothub API returned OK status but no text. Response: %s", string(responseBodyBytes))
-		return "", fmt.Errorf("Bothub API returned no text in response. Response body: %s", string(responseBodyBytes))
-	}
 	if transcriptionResp.Error != nil {
 		return "", fmt.Errorf("Bothub API returned an error in JSON response: %s (Type: %s)", transcriptionResp.Error.Message, transcriptionResp.Error.Type)
+	}
+	if transcriptionResp.Text == "" && transcriptionResp.Error == nil {
+		log.Printf("Warning: Bothub API returned OK status but no text. Response: %s", string(responseBodyBytes))
+		// Не возвращаем ошибку, если текст просто пустой, но нет явной ошибки API.
+		// Это может означать тишину в аудио.
 	}
 
 	log.Printf("STT: Successfully recognized text: \"%s\"", transcriptionResp.Text)
@@ -134,9 +159,8 @@ func recognizeSpeech(audioFilePath string, cfg *config.Config) (string, error) {
 }
 
 func convertOgaToWav(ogaPath string, wavPath string) error {
-	// ffmpeg -i input.oga -acodec pcm_s16le -ar 16000 -ac 1 output.wav
 	cmd := exec.Command("ffmpeg", "-i", ogaPath, "-y", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wavPath)
-	output, err := cmd.CombinedOutput() // Получаем и stdout, и stderr
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("ffmpeg error for %s -> %s: %v\nOutput: %s", ogaPath, wavPath, err, string(output))
 		return fmt.Errorf("ffmpeg conversion failed: %w. Output: %s", err, string(output))
@@ -156,12 +180,11 @@ func downloadFile(bot *tgbotapi.BotAPI, fileID string, localPath string) error {
 		url = fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", bot.Token, file.FilePath)
 	}
 
-	// Используем кастомный HTTP клиент с таймаутами
 	client := &http.Client{
-		Timeout: 30 * time.Second, // Общий таймаут на запрос
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			TLSHandshakeTimeout:   10 * time.Second, // Таймаут на TLS handshake
-			ResponseHeaderTimeout: 10 * time.Second, // Таймаут на получение заголовков ответа
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
@@ -184,7 +207,6 @@ func downloadFile(bot *tgbotapi.BotAPI, fileID string, localPath string) error {
 		return fmt.Errorf("io.Copy failed: %w", err)
 	}
 	log.Printf("Downloaded file %s to %s", fileID, localPath)
-
 	return nil
 }
 
@@ -195,7 +217,6 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 	log.Printf("[%s] (ChatID: %d) sent a voice message (FileID: %s, Duration: %d)",
 		message.From.UserName, chatID, voice.FileID, voice.Duration)
 
-	// 1. Создаем временный файл для .oga
 	ogaTempFile, err := os.CreateTemp("", "voice-*.oga")
 	if err != nil {
 		log.Printf("Error creating temp oga file: %v", err)
@@ -203,7 +224,7 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		return
 	}
 	ogaFilePath := ogaTempFile.Name()
-	ogaTempFile.Close() // Закрываем сразу, так как downloadFile и ffmpeg будут открывать его сами
+	ogaTempFile.Close()
 	defer func() {
 		log.Printf("Attempting to remove oga file: %s", ogaFilePath)
 		if err := os.Remove(ogaFilePath); err != nil && !os.IsNotExist(err) {
@@ -211,7 +232,6 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		}
 	}()
 
-	// 2. Скачать .oga файл
 	err = downloadFile(bot, voice.FileID, ogaFilePath)
 	if err != nil {
 		log.Printf("Error downloading voice file (ID: %s): %v", voice.FileID, err)
@@ -219,7 +239,6 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		return
 	}
 
-	// 3. Создаем временный файл для .wav
 	wavTempFile, err := os.CreateTemp("", "voice-*.wav")
 	if err != nil {
 		log.Printf("Error creating temp wav file: %v", err)
@@ -227,7 +246,7 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		return
 	}
 	wavFilePath := wavTempFile.Name()
-	wavTempFile.Close() // Закрываем сразу
+	wavTempFile.Close()
 	defer func() {
 		log.Printf("Attempting to remove wav file: %s", wavFilePath)
 		if err := os.Remove(wavFilePath); err != nil && !os.IsNotExist(err) {
@@ -235,7 +254,6 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		}
 	}()
 
-	// 4. Конвертировать в WAV
 	err = convertOgaToWav(ogaFilePath, wavFilePath)
 	if err != nil {
 		log.Printf("Error converting audio from %s to %s: %v", ogaFilePath, wavFilePath, err)
@@ -243,7 +261,6 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		return
 	}
 
-	// 5. Отправить в STT сервис
 	recognizedText, err := recognizeSpeech(wavFilePath, cfg)
 	if err != nil {
 		log.Printf("Error recognizing speech for file %s: %v", wavFilePath, err)
@@ -251,84 +268,336 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 		return
 	}
 
-	// 6. Отправить результат пользователю
 	msg := tgbotapi.NewMessage(chatID, recognizedText)
+	if recognizedText == "" {
+		msg.Text = "Не удалось извлечь текст из голосового сообщения (результат пуст)."
+	}
 	msg.ReplyToMessageID = message.MessageID
 	if _, err := bot.Send(msg); err != nil {
 		log.Printf("Error sending message to chat %d: %v", chatID, err)
 	}
 }
 
+// Новая функция для скачивания аудио с YouTube с помощью yt-dlp
+func downloadAudioFromYoutube(youtubeURL string) (string, error) {
+	tempFile, err := os.CreateTemp(os.TempDir(), "youtube_audio_*.mp3")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file for youtube audio name: %w", err)
+	}
+	mp3FilePath := tempFile.Name()
+	// Закрываем файл, так как yt-dlp будет писать в него по пути.
+	// Если не закрыть, в Windows может быть ошибка доступа.
+	if err := tempFile.Close(); err != nil {
+		log.Printf("Warning: failed to close temp file handle for %s: %v", mp3FilePath, err)
+		// Продолжаем, yt-dlp должен перезаписать
+	}
+	// Важно: некоторые версии yt-dlp могут требовать, чтобы файл не существовал,
+	// или могут иметь проблемы с перезаписью. Безопаснее удалить его, если он был создан пустым.
+	// os.Remove(mp3FilePath) // Раскомментировать, если yt-dlp жалуется на существующий файл
+
+	log.Printf("Downloading audio from YouTube URL: %s to %s", youtubeURL, mp3FilePath)
+	// Команда: yt-dlp -o "output_path.mp3" -x --audio-format mp3 VIDEO_URL
+	cmd := exec.Command("yt-dlp",
+		"-x", // извлечь аудио
+		"--audio-format", "mp3",
+		"-o", mp3FilePath, // путь для сохранения
+		youtubeURL,
+		"--no-playlist", // не скачивать плейлист, если ссылка на видео в плейлисте
+		"--quiet",       // меньше вывода
+		"--no-warnings", // нет предупреждений
+	)
+
+	var stdOutAndErr bytes.Buffer
+	cmd.Stdout = &stdOutAndErr
+	cmd.Stderr = &stdOutAndErr
+
+	err = cmd.Run()
+	if err != nil {
+		log.Printf("yt-dlp error for URL %s: %v\nOutput: %s", youtubeURL, err, stdOutAndErr.String())
+		// Попытка удалить файл, если он был частично создан или пуст
+		if _, statErr := os.Stat(mp3FilePath); statErr == nil {
+			os.Remove(mp3FilePath)
+		}
+		return "", fmt.Errorf("yt-dlp failed: %w. Output: %s", err, stdOutAndErr.String())
+	}
+
+	fileInfo, err := os.Stat(mp3FilePath)
+	if os.IsNotExist(err) {
+		log.Printf("yt-dlp ran but output file %s not found. Output: %s", mp3FilePath, stdOutAndErr.String())
+		return "", fmt.Errorf("yt-dlp output file not found: %s. Output: %s", mp3FilePath, stdOutAndErr.String())
+	}
+	if err != nil {
+		log.Printf("Error stating output file %s: %v. Output: %s", mp3FilePath, err, stdOutAndErr.String())
+		return "", fmt.Errorf("error stating yt-dlp output file %s: %w. Output: %s", mp3FilePath, err, stdOutAndErr.String())
+	}
+	if fileInfo.Size() == 0 {
+		log.Printf("yt-dlp created an empty file %s. Output: %s", mp3FilePath, stdOutAndErr.String())
+		os.Remove(mp3FilePath) // Удаляем пустой файл
+		return "", fmt.Errorf("yt-dlp created an empty file: %s. Output: %s", mp3FilePath, stdOutAndErr.String())
+	}
+
+	log.Printf("Successfully downloaded audio to %s (size: %d bytes)", mp3FilePath, fileInfo.Size())
+	return mp3FilePath, nil
+}
+
+// Новая функция для запроса к Bothub Chat Completions API
+func getChatCompletionFromBothub(text string, cfg *config.Config) (string, error) {
+	log.Printf("Requesting chat completion from Bothub for text starting with: %.80s...", text)
+
+	// Формируем контент для запроса.
+	// Согласно заданию, распознанный текст передается в поле content.
+	// Чтобы получить осмысленную информацию *о видео* на основе этого текста,
+	// лучше сформулировать запрос к модели.
+	userContent := "Проанализируй следующий текст, который был извлечен из аудиодорожки YouTube видео, и предоставь краткое содержание или ключевые моменты этого видео (отвечай на русском языке):\n\n\"" + text + "\""
+	// Если строго следовать "текст передается в content", то userContent = text.
+	// Однако, API ожидает инструкцию в 'content', как в примере "Tell me about Fiji".
+	// Мой вариант userContent является такой инструкцией, включающей текст.
+
+	requestPayload := ChatCompletionRequest{
+		Model: gptModelForYoutubeSummary,
+		Messages: []ChatMessage{
+			{
+				Role:    "user",
+				Content: userContent,
+			},
+		},
+	}
+
+	requestBodyBytes, err := json.Marshal(requestPayload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal chat completion request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", bothubChatCompletionsApiURL, bytes.NewBuffer(requestBodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create new HTTP request for chat completion: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+cfg.BothubApiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 120 * time.Second} // Таймаут для LLM может быть длинным
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute HTTP request to Bothub Chat API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body from Bothub Chat API: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Bothub Chat API returned non-OK status: %s. Response: %s", resp.Status, string(responseBodyBytes))
+		var errorResp ChatCompletionResponse
+		if json.Unmarshal(responseBodyBytes, &errorResp) == nil && errorResp.Error != nil {
+			return "", fmt.Errorf("Bothub Chat API error: %s (Type: %s, Code: %s, Param: %s), HTTP Status: %s",
+				errorResp.Error.Message, errorResp.Error.Type, errorResp.Error.Code, errorResp.Error.Param, resp.Status)
+		}
+		return "", fmt.Errorf("Bothub Chat API request failed with status %s and body: %s", resp.Status, string(responseBodyBytes))
+	}
+
+	var chatResponse ChatCompletionResponse
+	err = json.Unmarshal(responseBodyBytes, &chatResponse)
+	if err != nil {
+		return "", fmt.Errorf("failed to unmarshal JSON response from Bothub Chat API (%s): %w. Response body: %s", resp.Status, err, string(responseBodyBytes))
+	}
+
+	if chatResponse.Error != nil {
+		return "", fmt.Errorf("Bothub Chat API returned an error in JSON response: %s (Type: %s)", chatResponse.Error.Message, chatResponse.Error.Type)
+	}
+
+	if len(chatResponse.Choices) == 0 || chatResponse.Choices[0].Message.Content == "" {
+		log.Printf("Warning: Bothub Chat API returned OK status but no content. Response: %s", string(responseBodyBytes))
+		return "", fmt.Errorf("Bothub Chat API returned no content in response. Response body: %s", string(responseBodyBytes))
+	}
+
+	log.Printf("Bothub Chat API successfully returned completion.")
+	return chatResponse.Choices[0].Message.Content, nil
+}
+
+func handleYoutubeVideoInfoProcessing(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *config.Config) {
+	chatID := message.Chat.ID
+	youtubeURL := message.Text
+
+	processingMsg := tgbotapi.NewMessage(chatID, "Получил ссылку, начинаю обработку видео. Это может занять некоторое время...")
+	processingMsg.ReplyToMessageID = message.MessageID
+	sentMsg, err := bot.Send(processingMsg)
+	var messageIDToEdit int
+	if err == nil && sentMsg.MessageID != 0 {
+		messageIDToEdit = sentMsg.MessageID
+	} else if err != nil {
+		log.Printf("Error sending processing message: %v", err)
+	}
+
+	// 1. Скачать аудио с YouTube
+	mp3FilePath, err := downloadAudioFromYoutube(youtubeURL)
+	if err != nil {
+		log.Printf("Error downloading audio from YouTube %s: %v", youtubeURL, err)
+		replyText := fmt.Sprintf("Не удалось скачать аудио из видео: %v", err)
+		sendOrEditMessage(bot, chatID, messageIDToEdit, replyText, message.MessageID)
+		return
+	}
+	defer func() {
+		log.Printf("Attempting to remove YouTube audio file: %s", mp3FilePath)
+		if errRem := os.Remove(mp3FilePath); errRem != nil && !os.IsNotExist(errRem) {
+			log.Printf("Error removing temp YouTube audio file %s: %v", mp3FilePath, errRem)
+		}
+	}()
+
+	sendOrEditMessage(bot, chatID, messageIDToEdit, "Аудио извлечено, распознаю речь...", 0)
+
+	// 2. Распознать речь из аудиофайла
+	recognizedText, err := recognizeSpeech(mp3FilePath, cfg)
+	if err != nil {
+		log.Printf("Error recognizing speech from YouTube audio %s (file: %s): %v", youtubeURL, mp3FilePath, err)
+		replyText := fmt.Sprintf("Не удалось распознать речь из видео: %v", err)
+		sendOrEditMessage(bot, chatID, messageIDToEdit, replyText, message.MessageID)
+		return
+	}
+
+	if recognizedText == "" {
+		log.Printf("Recognized text is empty for YouTube audio %s (file: %s)", youtubeURL, mp3FilePath)
+		replyText := "Не удалось извлечь текст из видео (результат распознавания пуст)."
+		sendOrEditMessage(bot, chatID, messageIDToEdit, replyText, message.MessageID)
+		return
+	}
+
+	sendOrEditMessage(bot, chatID, messageIDToEdit, "Текст из видео получен, запрашиваю информацию у нейросети...", 0)
+
+	// 3. Передать текст в Bothub Chat Completions API
+	summary, err := getChatCompletionFromBothub(recognizedText, cfg)
+	if err != nil {
+		log.Printf("Error getting info from Bothub Chat API for YouTube video %s: %v", youtubeURL, err)
+		replyText := fmt.Sprintf("Не удалось получить информацию о видео от нейросети: %v", err)
+		sendOrEditMessage(bot, chatID, messageIDToEdit, replyText, message.MessageID)
+		return
+	}
+
+	// 4. Отправить результат пользователю
+	finalReply := fmt.Sprintf("Информация о видео (на основе аудиодорожки):\n\n%s", summary)
+	sendOrEditMessage(bot, chatID, messageIDToEdit, finalReply, message.MessageID)
+}
+
+// Вспомогательная функция для отправки или редактирования сообщения
+func sendOrEditMessage(bot *tgbotapi.BotAPI, chatID int64, messageIDToEdit int, text string, replyToMessageID int) {
+	var chattable tgbotapi.Chattable
+	if messageIDToEdit != 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, messageIDToEdit, text)
+		if len(editMsg.Text) > maxMessageTextLength {
+			editMsg.Text = editMsg.Text[:maxMessageTextLength-3] + "..."
+		}
+		chattable = editMsg
+	} else {
+		newMsg := tgbotapi.NewMessage(chatID, text)
+		if replyToMessageID != 0 { // Отвечаем на исходное сообщение, если не редактируем
+			newMsg.ReplyToMessageID = replyToMessageID
+		}
+		if len(newMsg.Text) > maxMessageTextLength {
+			newMsg.Text = newMsg.Text[:maxMessageTextLength-3] + "..."
+		}
+		chattable = newMsg
+	}
+
+	if _, err := bot.Send(chattable); err != nil {
+		log.Printf("Error sending/editing message to chat %d: %v", chatID, err)
+		// Если редактирование не удалось, можно попробовать отправить новое сообщение
+		if messageIDToEdit != 0 {
+			log.Printf("Editing failed for chat %d, attempting to send as new message.", chatID)
+			newMsgFallback := tgbotapi.NewMessage(chatID, text)
+			if replyToMessageID != 0 {
+				newMsgFallback.ReplyToMessageID = replyToMessageID
+			}
+			if len(newMsgFallback.Text) > maxMessageTextLength {
+				newMsgFallback.Text = newMsgFallback.Text[:maxMessageTextLength-3] + "..."
+			}
+			if _, fallbackErr := bot.Send(newMsgFallback); fallbackErr != nil {
+				log.Printf("Error sending fallback message to chat %d: %v", chatID, fallbackErr)
+			}
+		}
+	}
+}
+
 func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "Выберите опцию из меню или отправьте голосовое сообщение:")
-	// Создаем клавиатуру
+	msg := tgbotapi.NewMessage(chatID, "Выберите опцию, отправьте голосовое сообщение или ссылку на Youtube-видео:")
 	keyboard := tgbotapi.NewReplyKeyboard(
-		tgbotapi.NewKeyboardButtonRow( // Первый ряд кнопок
+		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton(menuCommandRecognize),
 			tgbotapi.NewKeyboardButton(menuCommandInfo),
 		),
-		tgbotapi.NewKeyboardButtonRow( // Второй ряд кнопок
+		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton(menuCommandSettings),
+			tgbotapi.NewKeyboardButton(menuCommandYoutubeInfo),
 		),
 	)
-	// keyboard.OneTimeKeyboard = true // Если нужно скрыть клавиатуру после одного нажатия
-	keyboard.ResizeKeyboard = true // Делает кнопки более компактными
-
+	keyboard.ResizeKeyboard = true
 	msg.ReplyMarkup = keyboard
 	if _, err := bot.Send(msg); err != nil {
 		log.Printf("Error sending main menu: %v", err)
 	}
 }
 
+func checkDependencies() {
+	missingDeps := []string{}
+	if _, err := exec.LookPath("yt-dlp"); err != nil {
+		log.Println("WARNING: yt-dlp not found in PATH. Youtube video processing will fail.")
+		missingDeps = append(missingDeps, "yt-dlp")
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		log.Println("WARNING: ffmpeg not found in PATH. Voice message and Youtube video processing may fail.")
+		missingDeps = append(missingDeps, "ffmpeg")
+	}
+
+	if len(missingDeps) == 0 {
+		log.Println("Dependencies (yt-dlp, ffmpeg) checked successfully.")
+	} else {
+		log.Printf("Please install missing dependencies: %v", missingDeps)
+	}
+}
+
 func main() {
 	cfg := &config.Config{}
-	// инициализация конфига
 	if err := coreconfig.Load(cfg, ""); err != nil {
-		log.Panic("Can't load config file", err)
+		log.Panic("Can't load config file: ", err)
 	}
 
 	botToken := cfg.TelegramBotToken
 	if botToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN environment variable not set")
 	}
+	if cfg.BothubApiToken == "" {
+		log.Fatal("BOTHUB_API_TOKEN environment variable not set in config")
+	}
+
+	checkDependencies() // Проверка наличия yt-dlp и ffmpeg
 
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
-		log.Fatal("NewBotAPI error: %v", err)
+		log.Fatalf("NewBotAPI error: %v", err) // Используем Fatalf для единого стиля
 	}
 
-	bot.Debug = true // Установите в false для продакшена
+	bot.Debug = true // Установить в false для продакшена
 	log.Printf("Authorized on account %s", bot.Self.UserName)
-
-	// Создаем директорию для временных файлов, если ее нет (os.CreateTemp может использовать системную)
-	// tempDir := "./temp_audio"
-	// if _, err := os.Stat(tempDir); os.IsNotExist(err) {
-	// 	os.Mkdir(tempDir, 0755)
-	// }
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
 	updates := bot.GetUpdatesChan(u)
-
-	// Ограничение количества одновременно обрабатываемых запросов (опционально)
 	semaphore := make(chan struct{}, concurrencyLimit)
 
 	for update := range updates {
-		// Обрабатываем только сообщения, пропускаем другие типы обновлений
 		if update.Message == nil {
 			continue
 		}
 
-		// Обрабатываем каждое сообщение в отдельной горутине, чтобы не блокировать получение других
 		go func(currentUpdate tgbotapi.Update) {
-			semaphore <- struct{}{}        // Занимаем слот
-			defer func() { <-semaphore }() // Освобождаем слот
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
 			message := currentUpdate.Message
 			chatID := message.Chat.ID
 
-			// Обработка команд и текстовых сообщений
 			if message.IsCommand() {
 				switch message.Command() {
 				case "start", "menu":
@@ -337,43 +606,52 @@ func main() {
 					msg := tgbotapi.NewMessage(chatID, "Неизвестная команда. Используйте /start или /menu для отображения меню.")
 					bot.Send(msg)
 				}
-				return // Команда обработана, выходим из горутины для этого сообщения
+				return
 			}
 
-			// Обработка нажатий на кнопки ReplyKeyboard (они приходят как обычный текст)
+			isHandled := false
 			switch message.Text {
 			case menuCommandRecognize:
 				msg := tgbotapi.NewMessage(chatID, "Пожалуйста, отправьте мне голосовое сообщение для распознавания.")
 				bot.Send(msg)
+				isHandled = true
 			case menuCommandInfo:
-				msgText := "Я бот для распознавания речи.\n"
-				msgText += "Отправьте мне голосовое сообщение, и я переведу его в текст.\n"
-				msgText += "Используется API от bothub.chat (на базе OpenAI Whisper).\n"
-				msgText += "Разработчик: Pomogalov Vladimir\n"
-				msgText += "Версия: 0.1.0"
+				msgText := "Я бот для обработки аудио и видео.\n"
+				msgText += "- Распознаю речь из голосовых сообщений.\n"
+				msgText += "- Предоставляю информацию о Youtube-видео (на основе аудиодорожки).\n"
+				msgText += "Используется API от bothub.chat.\n"
+				msgText += "Разработчик: Pomogalov Vladimir (доработано AI)\n"
+				msgText += "Версия: 0.2.0"
 				msg := tgbotapi.NewMessage(chatID, msgText)
 				bot.Send(msg)
+				isHandled = true
 			case menuCommandSettings:
 				msg := tgbotapi.NewMessage(chatID, "Раздел настроек пока в разработке.")
-				// Здесь можно добавить InlineKeyboardMarkup для настроек, если нужно
 				bot.Send(msg)
+				isHandled = true
+			case menuCommandYoutubeInfo:
+				msg := tgbotapi.NewMessage(chatID, "Пожалуйста, отправьте мне ссылку на Youtube-видео.")
+				bot.Send(msg)
+				isHandled = true
 			default:
-				// Если это не команда и не кнопка меню, и не голосовое, то это просто текст
-				if message.Voice == nil && message.Text != "" {
-					// Можно предложить меню, если пользователь просто написал текст
-					msg := tgbotapi.NewMessage(chatID, "Я не совсем понял. Может, выберете что-то из меню?")
-					msg.ReplyToMessageID = message.MessageID
-					bot.Send(msg)
-					sendMainMenu(bot, chatID) // Или сразу показать меню
-					log.Printf("[%s] sent text: %s", message.From.UserName, message.Text)
+				if isValidYoutubeLink(message.Text) {
+					handleYoutubeVideoInfoProcessing(bot, message, cfg)
+					isHandled = true
 				}
 			}
 
-			// Обработка голосовых сообщений
 			if message.Voice != nil {
 				handleVoiceMessage(bot, message, cfg)
+				isHandled = true
 			}
 
+			if !isHandled && message.Text != "" { // Если это не команда, не кнопка, не ссылка, не голосовое
+				log.Printf("[%s] (ChatID: %d) sent unhandled text: %s", message.From.UserName, chatID, message.Text)
+				msg := tgbotapi.NewMessage(chatID, "Я не совсем понял. Может, выберете что-то из меню, отправите голосовое сообщение или ссылку на Youtube?")
+				msg.ReplyToMessageID = message.MessageID
+				bot.Send(msg)
+				sendMainMenu(bot, chatID)
+			}
 		}(update)
 	}
 }
