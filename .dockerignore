@@ -1,0 +1,7 @@
+.git
+*.md
+*.oga
+*.wav
+*.mp3
+upload/cookies.txt
+*.log

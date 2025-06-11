@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"main/internal/config"
+	"main/internal/model"
 	coreconfig "main/tools/pkg/core_config"
 	"mime/multipart"
 	"net/http"
@@ -32,45 +33,6 @@ const (
 	menuCommandSettings    = "⚙️ Настройки"
 	menuCommandYoutubeInfo = "🎞️ Инфо о Youtube-видео" // Новый пункт меню
 )
-
-// Структура для разбора JSON-ответа от API распознавания речи
-type TranscriptionResponse struct {
-	Text  string `json:"text"`
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Param   string `json:"param"`
-		Code    string `json:"code"`
-	} `json:"error,omitempty"`
-}
-
-// Структуры для API Chat Completions
-type ChatCompletionRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-}
-
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ChatCompletionResponse struct {
-	Choices []struct {
-		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"message"`
-		// Могут быть и другие поля, например, finish_reason, но для задачи нужен только content
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Param   string `json:"param"`
-		Code    string `json:"code"`
-	} `json:"error,omitempty"`
-	// Можно добавить другие поля если нужно, например, Usage
-}
 
 var youtubeRegex = regexp.MustCompile(`^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+(\S*)?$`)
 
@@ -131,7 +93,7 @@ func recognizeSpeech(audioFilePath string, cfg *config.Config) (string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Bothub API returned non-OK status: %s. Response: %s", resp.Status, string(responseBodyBytes))
-		var errorResp TranscriptionResponse
+		var errorResp model.TranscriptionResponse
 		if json.Unmarshal(responseBodyBytes, &errorResp) == nil && errorResp.Error != nil {
 			return "", fmt.Errorf("Bothub API error: %s (Type: %s, Code: %s, Param: %s), HTTP Status: %s",
 				errorResp.Error.Message, errorResp.Error.Type, errorResp.Error.Code, errorResp.Error.Param, resp.Status)
@@ -139,7 +101,7 @@ func recognizeSpeech(audioFilePath string, cfg *config.Config) (string, error) {
 		return "", fmt.Errorf("Bothub API request failed with status %s and body: %s", resp.Status, string(responseBodyBytes))
 	}
 
-	var transcriptionResp TranscriptionResponse
+	var transcriptionResp model.TranscriptionResponse
 	err = json.Unmarshal(responseBodyBytes, &transcriptionResp)
 	if err != nil {
 		return "", fmt.Errorf("failed to unmarshal JSON response from Bothub API (%s): %w. Response body: %s", resp.Status, err, string(responseBodyBytes))
@@ -279,33 +241,45 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 }
 
 // Новая функция для скачивания аудио с YouTube с помощью yt-dlp
-func downloadAudioFromYoutube(youtubeURL string) (string, error) {
-	tempFile, err := os.CreateTemp(os.TempDir(), "youtube_audio_*.mp3")
+func downloadAudioFromYoutube(youtubeURL string, cfg *config.Config) (string, error) { // <--- Добавлен cfg
+	//	tempFile, err := os.CreateTemp(os.TempDir(), "youtube_audio_*.mp3")
+	tempFile, err := os.CreateTemp("./upload", "youtube_audio_*.mp3")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file for youtube audio name: %w", err)
 	}
 	mp3FilePath := tempFile.Name()
-	// Закрываем файл, так как yt-dlp будет писать в него по пути.
-	// Если не закрыть, в Windows может быть ошибка доступа.
 	if err := tempFile.Close(); err != nil {
 		log.Printf("Warning: failed to close temp file handle for %s: %v", mp3FilePath, err)
-		// Продолжаем, yt-dlp должен перезаписать
 	}
-	// Важно: некоторые версии yt-dlp могут требовать, чтобы файл не существовал,
-	// или могут иметь проблемы с перезаписью. Безопаснее удалить его, если он был создан пустым.
-	// os.Remove(mp3FilePath) // Раскомментировать, если yt-dlp жалуется на существующий файл
+	os.Remove(mp3FilePath)
 
 	log.Printf("Downloading audio from YouTube URL: %s to %s", youtubeURL, mp3FilePath)
-	// Команда: yt-dlp -o "output_path.mp3" -x --audio-format mp3 VIDEO_URL
-	cmd := exec.Command("yt-dlp",
+
+	args := []string{
+		"-o", mp3FilePath, // путь для сохранения
 		"-x", // извлечь аудио
 		"--audio-format", "mp3",
-		"-o", mp3FilePath, // путь для сохранения
-		youtubeURL,
-		"--no-playlist", // не скачивать плейлист, если ссылка на видео в плейлисте
+		"--no-playlist", // не скачивать плейлист
 		"--quiet",       // меньше вывода
 		"--no-warnings", // нет предупреждений
-	)
+	}
+
+	// Добавляем cookies, если путь указан в конфиге
+	if cfg.YoutubeCookiesPath != "" {
+		// Проверяем, существует ли файл cookies
+		if _, err := os.Stat(cfg.YoutubeCookiesPath); err == nil {
+			log.Printf("Using YouTube cookies from: %s", cfg.YoutubeCookiesPath)
+			args = append(args, "--cookies", cfg.YoutubeCookiesPath)
+		} else {
+			log.Printf("WARNING: YouTube cookies file specified but not found at %s: %v. Proceeding without cookies.", cfg.YoutubeCookiesPath, err)
+		}
+	} else {
+		log.Println("WARNING: YouTube cookies file not specified in config. Downloads may fail due to bot detection.")
+	}
+
+	args = append(args, youtubeURL) // URL всегда последний
+
+	cmd := exec.Command("yt-dlp", args...)
 
 	var stdOutAndErr bytes.Buffer
 	cmd.Stdout = &stdOutAndErr
@@ -314,7 +288,6 @@ func downloadAudioFromYoutube(youtubeURL string) (string, error) {
 	err = cmd.Run()
 	if err != nil {
 		log.Printf("yt-dlp error for URL %s: %v\nOutput: %s", youtubeURL, err, stdOutAndErr.String())
-		// Попытка удалить файл, если он был частично создан или пуст
 		if _, statErr := os.Stat(mp3FilePath); statErr == nil {
 			os.Remove(mp3FilePath)
 		}
@@ -332,7 +305,7 @@ func downloadAudioFromYoutube(youtubeURL string) (string, error) {
 	}
 	if fileInfo.Size() == 0 {
 		log.Printf("yt-dlp created an empty file %s. Output: %s", mp3FilePath, stdOutAndErr.String())
-		os.Remove(mp3FilePath) // Удаляем пустой файл
+		os.Remove(mp3FilePath)
 		return "", fmt.Errorf("yt-dlp created an empty file: %s. Output: %s", mp3FilePath, stdOutAndErr.String())
 	}
 
@@ -353,9 +326,9 @@ func getChatCompletionFromBothub(text string, cfg *config.Config) (string, error
 	// Однако, API ожидает инструкцию в 'content', как в примере "Tell me about Fiji".
 	// Мой вариант userContent является такой инструкцией, включающей текст.
 
-	requestPayload := ChatCompletionRequest{
+	requestPayload := model.ChatCompletionRequest{
 		Model: gptModelForYoutubeSummary,
-		Messages: []ChatMessage{
+		Messages: []model.ChatMessage{
 			{
 				Role:    "user",
 				Content: userContent,
@@ -390,7 +363,7 @@ func getChatCompletionFromBothub(text string, cfg *config.Config) (string, error
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Bothub Chat API returned non-OK status: %s. Response: %s", resp.Status, string(responseBodyBytes))
-		var errorResp ChatCompletionResponse
+		var errorResp model.ChatCompletionResponse
 		if json.Unmarshal(responseBodyBytes, &errorResp) == nil && errorResp.Error != nil {
 			return "", fmt.Errorf("Bothub Chat API error: %s (Type: %s, Code: %s, Param: %s), HTTP Status: %s",
 				errorResp.Error.Message, errorResp.Error.Type, errorResp.Error.Code, errorResp.Error.Param, resp.Status)
@@ -398,7 +371,7 @@ func getChatCompletionFromBothub(text string, cfg *config.Config) (string, error
 		return "", fmt.Errorf("Bothub Chat API request failed with status %s and body: %s", resp.Status, string(responseBodyBytes))
 	}
 
-	var chatResponse ChatCompletionResponse
+	var chatResponse model.ChatCompletionResponse
 	err = json.Unmarshal(responseBodyBytes, &chatResponse)
 	if err != nil {
 		return "", fmt.Errorf("failed to unmarshal JSON response from Bothub Chat API (%s): %w. Response body: %s", resp.Status, err, string(responseBodyBytes))
@@ -432,7 +405,7 @@ func handleYoutubeVideoInfoProcessing(bot *tgbotapi.BotAPI, message *tgbotapi.Me
 	}
 
 	// 1. Скачать аудио с YouTube
-	mp3FilePath, err := downloadAudioFromYoutube(youtubeURL)
+	mp3FilePath, err := downloadAudioFromYoutube(youtubeURL, cfg)
 	if err != nil {
 		log.Printf("Error downloading audio from YouTube %s: %v", youtubeURL, err)
 		replyText := fmt.Sprintf("Не удалось скачать аудио из видео: %v", err)
@@ -568,6 +541,15 @@ func main() {
 	}
 	if cfg.BothubApiToken == "" {
 		log.Fatal("BOTHUB_API_TOKEN environment variable not set in config")
+	}
+	if cfg.YoutubeCookiesPath == "" {
+		log.Println("INFO: YOUTUBE_COOKIES_PATH is not set in config. YouTube video downloads might be restricted or fail due to bot detection. It is recommended to provide a cookies.txt file for reliable operation.")
+	} else {
+		if _, err := os.Stat(cfg.YoutubeCookiesPath); os.IsNotExist(err) {
+			log.Printf("WARNING: YOUTUBE_COOKIES_PATH is set to '%s', but the file was not found. YouTube video downloads might fail.", cfg.YoutubeCookiesPath)
+		} else {
+			log.Printf("INFO: Using YouTube cookies from: %s", cfg.YoutubeCookiesPath)
+		}
 	}
 
 	checkDependencies() // Проверка наличия yt-dlp и ffmpeg
