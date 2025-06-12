@@ -240,7 +240,6 @@ func handleVoiceMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, cfg *co
 	}
 }
 
-// Новая функция для скачивания аудио с YouTube с помощью yt-dlp
 func downloadAudioFromYoutube(youtubeURL string, cfg *config.Config) (string, error) { // <--- Добавлен cfg
 	//	tempFile, err := os.CreateTemp(os.TempDir(), "youtube_audio_*.mp3")
 	tempFile, err := os.CreateTemp("./upload", "youtube_audio_*.mp3")
@@ -313,7 +312,6 @@ func downloadAudioFromYoutube(youtubeURL string, cfg *config.Config) (string, er
 	return mp3FilePath, nil
 }
 
-// Новая функция для запроса к Bothub Chat Completions API
 func getChatCompletionFromBothub(text string, cfg *config.Config) (string, error) {
 	log.Printf("Requesting chat completion from Bothub for text starting with: %.80s...", text)
 
